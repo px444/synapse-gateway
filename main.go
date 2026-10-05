@@ -11,10 +11,14 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 )
 
-// --- 1. Structs for Google Gemini Embedding API ---
+// ==========================================
+// 1. Google Gemini API Structs
+// ==========================================
 
+// For getting embedding vectors (768 numbers)
 type EmbedRequest struct {
 	Content struct {
 		Parts []struct {
@@ -29,20 +33,39 @@ type EmbedResponse struct {
 	} `json:"embedding"`
 }
 
-// --- 2. In-Memory Cache Structures ---
+// For getting generated answers from Gemini
+type ChatRequest struct {
+	Contents []struct {
+		Parts []struct {
+			Text string `json:"text"`
+		} `json:"parts"`
+	} `json:"contents"`
+}
 
-// CacheEntry holds the prompt, its 768-dim embedding, and the cached answer.
+type ChatResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+}
+
+// ==========================================
+// 2. In-Memory Cache Structures
+// ==========================================
+
 type CacheEntry struct {
 	Prompt    string
 	Embedding []float32
 	Response  string
 }
 
-// SemanticCache manages exact string lookups and vector searches.
 type SemanticCache struct {
 	mu      sync.RWMutex
 	exact   map[string]string // SHA-256 hash -> Response
-	entries []CacheEntry      // Stored vectors for semantic scan
+	entries []CacheEntry      // Vector list
 }
 
 func NewSemanticCache() *SemanticCache {
@@ -52,13 +75,11 @@ func NewSemanticCache() *SemanticCache {
 	}
 }
 
-// hashPrompt turns a prompt into a SHA-256 string for O(1) exact lookups.
 func hashPrompt(prompt string) string {
 	h := sha256.Sum256([]byte(prompt))
 	return hex.EncodeToString(h[:])
 }
 
-// CosineSimilarity computes the dot product of two unit-normalized vectors.
 func CosineSimilarity(a, b []float32) float32 {
 	if len(a) != len(b) {
 		return 0.0
@@ -70,18 +91,21 @@ func CosineSimilarity(a, b []float32) float32 {
 	return dot
 }
 
-// Get checks exact cache first, then scans vectors for similarity.
 func (c *SemanticCache) Get(prompt string, vec []float32, threshold float32) (string, string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Tier 1: Exact Hash Match (O(1))
+	// 1. Exact match (L1)
 	hash := hashPrompt(prompt)
 	if resp, exists := c.exact[hash]; exists {
 		return resp, "EXACT_HIT", true
 	}
 
-	// Tier 2: Vector Semantic Search (Linear Scan)
+	// 2. Semantic match (L2)
+	if vec == nil {
+		return "", "CACHE_MISS", false
+	}
+
 	var bestScore float32 = -1.0
 	var bestResp string
 
@@ -100,14 +124,12 @@ func (c *SemanticCache) Get(prompt string, vec []float32, threshold float32) (st
 	return "", "CACHE_MISS", false
 }
 
-// Set stores the prompt, its embedding, and the response.
 func (c *SemanticCache) Set(prompt string, vec []float32, response string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	hash := hashPrompt(prompt)
 	c.exact[hash] = response
-
 	c.entries = append(c.entries, CacheEntry{
 		Prompt:    prompt,
 		Embedding: vec,
@@ -115,8 +137,11 @@ func (c *SemanticCache) Set(prompt string, vec []float32, response string) {
 	})
 }
 
-// --- 3. Gemini Helper ---
+// ==========================================
+// 3. Gemini API Calls
+// ==========================================
 
+// Get 768 coordinate numbers representing the sentence
 func getEmbedding(apiKey, text string) ([]float32, error) {
 	reqPayload := EmbedRequest{}
 	reqPayload.Content.Parts = []struct {
@@ -137,18 +162,116 @@ func getEmbedding(apiKey, text string) ([]float32, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("embedding API HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result EmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	return result.Embedding.Values, nil
 }
 
-// --- 4. Main Demonstration ---
+// Ask Gemini for an answer when cache misses
+func generateCompletion(apiKey, prompt string) (string, error) {
+	reqPayload := ChatRequest{}
+	reqPayload.Contents = []struct {
+		Parts []struct {
+			Text string `json:"text"`
+		} `json:"parts"`
+	}{
+		{
+			Parts: []struct {
+				Text string `json:"text"`
+			}{{Text: prompt}},
+		},
+	}
+
+	jsonBody, err := json.Marshal(reqPayload)
+	if err != nil {
+		return "", err
+	}
+
+	// Updated to gemini-3.8-flash as required by the API
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=%s", apiKey)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat API HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("empty answer received from Gemini")
+	}
+
+	return result.Candidates[0].Content.Parts[0].Text, nil
+}
+
+func generateCompletionWithRetry(apiKey, prompt string, maxRetries int) (string, error) {
+	backoff := 500 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		ans, err := generateCompletion(apiKey, prompt)
+		if err == nil {
+			return ans, nil
+		}
+
+		// If it's a 503 (high demand), sleep briefly and try again
+		log.Printf("[Attempt %d/%d] Model busy (503). Retrying in %v...", attempt+1, maxRetries, backoff)
+		time.Sleep(backoff)
+		backoff *= 2 // Exponential backoff: 500ms -> 1s -> 2s
+	}
+
+	return "", fmt.Errorf("exceeded max retries due to high demand")
+}
+
+// ==========================================
+// 4. Gateway Dispatcher
+// ==========================================
+
+func HandlePrompt(cache *SemanticCache, apiKey, prompt string, threshold float32) (string, string, time.Duration) {
+	startTime := time.Now()
+
+	// 1. Exact Hit (L1)
+	if resp, hitType, ok := cache.Get(prompt, nil, threshold); ok {
+		return resp, hitType, time.Since(startTime)
+	}
+
+	// 2. Semantic Hit (L2)
+	vec, err := getEmbedding(apiKey, prompt)
+	if err == nil {
+		if resp, hitType, ok := cache.Get(prompt, vec, threshold); ok {
+			return resp, hitType, time.Since(startTime)
+		}
+	}
+
+	// 3. Cache Miss: Ask Gemini
+	answer, err := generateCompletionWithRetry(apiKey, prompt, 3)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), "ERROR", time.Since(startTime)
+	}
+
+	// 4. Save to cache for next time
+	if vec != nil {
+		cache.Set(prompt, vec, answer)
+	}
+
+	return answer, "CACHE_MISS (Fetched from Gemini)", time.Since(startTime)
+}
+
+// ==========================================
+// 5. Main Execution
+// ==========================================
 
 func main() {
 	apiKey := os.Getenv("GEMINI_API_KEY")
@@ -157,43 +280,23 @@ func main() {
 	}
 
 	cache := NewSemanticCache()
-	similarityThreshold := float32(0.88)
+	threshold := float32(0.88)
 
-	// Step A: Seed the cache with an initial answered question
-	seedPrompt := "How do I cancel my subscription?"
-	seedAnswer := "Go to Account Settings -> Billing -> Click 'Cancel Subscription'."
+	// Test 1: Cold Start (Cache miss -> calls Gemini)
+	q1 := "What is the capital of France?"
+	fmt.Printf("[Test 1: Cold Start] Prompt: %q\n", q1)
+	ans1, status1, dur1 := HandlePrompt(cache, apiKey, q1, threshold)
+	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n\n", status1, dur1, ans1)
 
-	fmt.Println("1. Embedding and seeding original Q&A into cache...")
-	seedVec, err := getEmbedding(apiKey, seedPrompt)
-	if err != nil {
-		log.Fatalf("Failed to embed seed prompt: %v", err)
-	}
-	cache.Set(seedPrompt, seedVec, seedAnswer)
-	fmt.Println("   Seed prompt stored successfully!")
+	// Test 2: Exact Match (L1 hit in microseconds -> 0 API calls)
+	q2 := "What is the capital of France?"
+	fmt.Printf("[Test 2: Exact Match] Prompt: %q\n", q2)
+	ans2, status2, dur2 := HandlePrompt(cache, apiKey, q2, threshold)
+	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n\n", status2, dur2, ans2)
 
-	// Step B: Query with an exact match
-	test1 := "How do I cancel my subscription?"
-	fmt.Printf("2. Querying exact match: %q\n", test1)
-	resp, hitType, hit := cache.Get(test1, nil, similarityThreshold)
-	fmt.Printf("   Result: %s | Hit: %t\n   Answer: %s\n\n", hitType, hit, resp)
-
-	// Step C: Query with a paraphrase (semantic match)
-	test2 := "Where can I terminate my plan?"
-	fmt.Printf("3. Querying paraphrase: %q\n", test2)
-	test2Vec, err := getEmbedding(apiKey, test2)
-	if err != nil {
-		log.Fatalf("Failed to embed test2 prompt: %v", err)
-	}
-	resp, hitType, hit = cache.Get(test2, test2Vec, similarityThreshold)
-	fmt.Printf("   Result: %s | Hit: %t\n   Answer: %s\n\n", hitType, hit, resp)
-
-	// Step D: Query with an unrelated question
-	test3 := "How do I bake chocolate chip cookies?"
-	fmt.Printf("4. Querying unrelated question: %q\n", test3)
-	test3Vec, err := getEmbedding(apiKey, test3)
-	if err != nil {
-		log.Fatalf("Failed to embed test3 prompt: %v", err)
-	}
-	resp, hitType, hit = cache.Get(test3, test3Vec, similarityThreshold)
-	fmt.Printf("   Result: %s | Hit: %t\n   Answer: (none, forwarded to LLM)\n", hitType, hit)
+	// Test 3: Paraphrase (L2 Semantic hit -> gets cached answer without asking LLM)
+	q3 := "Can you tell me the capital city of France?"
+	fmt.Printf("[Test 3: Paraphrase] Prompt: %q\n", q3)
+	ans3, status3, dur3 := HandlePrompt(cache, apiKey, q3, threshold)
+	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n", status3, dur3, ans3)
 }
