@@ -1,0 +1,18 @@
+# Environment files (never commit API keys)
+.env
+*.env
+
+# Go binaries and build artifacts
+synapse-gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/
