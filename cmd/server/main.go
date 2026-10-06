@@ -11,15 +11,20 @@ import (
 )
 
 func main() {
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey == "" {
 		log.Fatal("GEMINI_API_KEY environment variable is not set")
 	}
 
-	// Initialize components
+	groqKey := os.Getenv("GROQ_API_KEY") // Optional fallback key
+
+	// Initialize dependencies
 	semanticCache := cache.NewSemanticCache()
-	geminiClient := client.NewGeminiClient(apiKey)
-	gatewayHandler := proxy.NewGatewayHandler(semanticCache, geminiClient, 0.88)
+	geminiClient := client.NewGeminiClient(geminiKey)
+	groqClient := client.NewGroqClient(groqKey)
+
+	// Notice all 4 arguments passed here:
+	gatewayHandler := proxy.NewGatewayHandler(semanticCache, geminiClient, groqClient, 0.88)
 
 	// Routes
 	http.Handle("/v1/chat/completions", gatewayHandler)

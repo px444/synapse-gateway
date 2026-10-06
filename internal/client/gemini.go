@@ -43,11 +43,17 @@ type ChatResponse struct {
 }
 
 type GeminiClient struct {
-	apiKey string
+	apiKey     string
+	httpClient *http.Client
 }
 
 func NewGeminiClient(apiKey string) *GeminiClient {
-	return &GeminiClient{apiKey: apiKey}
+	return &GeminiClient{
+		apiKey: apiKey,
+		httpClient: &http.Client{
+			Timeout: 8 * time.Second, // Fails fast on spikes instead of hanging indefinitely
+		},
+	}
 }
 
 func (g *GeminiClient) GetEmbedding(text string) ([]float32, error) {
@@ -62,7 +68,7 @@ func (g *GeminiClient) GetEmbedding(text string) ([]float32, error) {
 	}
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=%s", g.apiKey)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := g.httpClient.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +106,7 @@ func (g *GeminiClient) GenerateCompletion(prompt string) (string, error) {
 	}
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=%s", g.apiKey)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := g.httpClient.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", err
 	}

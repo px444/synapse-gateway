@@ -26,14 +26,16 @@ type ErrorResponse struct {
 
 type GatewayHandler struct {
 	cache     *cache.SemanticCache
-	client    *client.GeminiClient
+	gemini    *client.GeminiClient
+	groq      *client.GroqClient
 	threshold float32
 }
 
-func NewGatewayHandler(c *cache.SemanticCache, gc *client.GeminiClient, threshold float32) *GatewayHandler {
+func NewGatewayHandler(c *cache.SemanticCache, gc *client.GeminiClient, groq *client.GroqClient, threshold float32) *GatewayHandler {
 	return &GatewayHandler{
 		cache:     c,
-		client:    gc,
+		gemini:    gc,
+		groq:      groq,
 		threshold: threshold,
 	}
 }
@@ -47,7 +49,7 @@ func (h *GatewayHandler) HandlePrompt(prompt string) (string, string, time.Durat
 	}
 
 	// 2. Semantic Hit (L2)
-	vec, err := h.client.GetEmbedding(prompt)
+	vec, err := h.gemini.GetEmbedding(prompt)
 	if err == nil {
 		if resp, hitType, ok := h.cache.Get(prompt, vec, h.threshold); ok {
 			return resp, hitType, time.Since(startTime), nil
@@ -56,18 +58,35 @@ func (h *GatewayHandler) HandlePrompt(prompt string) (string, string, time.Durat
 		log.Printf("Warning: failed to compute embedding: %v", err)
 	}
 
-	// 3. Cache Miss: Upstream Call
-	answer, err := h.client.GenerateCompletionWithRetry(prompt, 3)
+	// 3. Primary Provider (Gemini with Retry)
+	answer, err := h.gemini.GenerateCompletionWithRetry(prompt, 3)
+	hitSource := "CACHE_MISS (Gemini Primary)"
+
+	// 4. Failover to Secondary Provider (Groq) if Gemini fails
+	if err != nil {
+		log.Printf("⚠️ Primary provider (Gemini) failed: %v. Initiating failover to Groq...", err)
+		if h.groq != nil {
+			fallbackAnswer, fallbackErr := h.groq.GenerateCompletion(prompt)
+			if fallbackErr == nil {
+				answer = fallbackAnswer
+				hitSource = "CACHE_MISS (Groq Failover)"
+				err = nil
+			} else {
+				log.Printf("❌ Secondary provider (Groq) also failed: %v", fallbackErr)
+			}
+		}
+	}
+
 	if err != nil {
 		return "", "ERROR", time.Since(startTime), err
 	}
 
-	// 4. Save to Cache
+	// 5. Save to Cache so future requests hit RAM
 	if vec != nil {
 		h.cache.Set(prompt, vec, answer)
 	}
 
-	return answer, "CACHE_MISS (Fetched Upstream)", time.Since(startTime), nil
+	return answer, hitSource, time.Since(startTime), nil
 }
 
 func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
