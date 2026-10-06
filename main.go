@@ -15,10 +15,9 @@ import (
 )
 
 // ==========================================
-// 1. Google Gemini API Structs
+// 1. Upstream Gemini API Structs
 // ==========================================
 
-// For getting embedding vectors (768 numbers)
 type EmbedRequest struct {
 	Content struct {
 		Parts []struct {
@@ -33,7 +32,6 @@ type EmbedResponse struct {
 	} `json:"embedding"`
 }
 
-// For getting generated answers from Gemini
 type ChatRequest struct {
 	Contents []struct {
 		Parts []struct {
@@ -53,7 +51,25 @@ type ChatResponse struct {
 }
 
 // ==========================================
-// 2. In-Memory Cache Structures
+// 2. Gateway HTTP Request / Response DTOs
+// ==========================================
+
+type ChatCompletionRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+type ChatCompletionResponse struct {
+	Response  string `json:"response"`
+	HitType   string `json:"hit_type"`
+	LatencyMs int64  `json:"latency_ms"`
+}
+
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// ==========================================
+// 3. In-Memory Cache Structures
 // ==========================================
 
 type CacheEntry struct {
@@ -64,8 +80,8 @@ type CacheEntry struct {
 
 type SemanticCache struct {
 	mu      sync.RWMutex
-	exact   map[string]string // SHA-256 hash -> Response
-	entries []CacheEntry      // Vector list
+	exact   map[string]string
+	entries []CacheEntry
 }
 
 func NewSemanticCache() *SemanticCache {
@@ -95,13 +111,13 @@ func (c *SemanticCache) Get(prompt string, vec []float32, threshold float32) (st
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// 1. Exact match (L1)
+	// Tier 1: Exact Hash Match
 	hash := hashPrompt(prompt)
 	if resp, exists := c.exact[hash]; exists {
 		return resp, "EXACT_HIT", true
 	}
 
-	// 2. Semantic match (L2)
+	// Tier 2: Semantic Vector Scan
 	if vec == nil {
 		return "", "CACHE_MISS", false
 	}
@@ -138,10 +154,9 @@ func (c *SemanticCache) Set(prompt string, vec []float32, response string) {
 }
 
 // ==========================================
-// 3. Gemini API Calls
+// 4. Gemini API Client
 // ==========================================
 
-// Get 768 coordinate numbers representing the sentence
 func getEmbedding(apiKey, text string) ([]float32, error) {
 	reqPayload := EmbedRequest{}
 	reqPayload.Content.Parts = []struct {
@@ -172,7 +187,6 @@ func getEmbedding(apiKey, text string) ([]float32, error) {
 	return result.Embedding.Values, nil
 }
 
-// Ask Gemini for an answer when cache misses
 func generateCompletion(apiKey, prompt string) (string, error) {
 	reqPayload := ChatRequest{}
 	reqPayload.Contents = []struct {
@@ -192,7 +206,6 @@ func generateCompletion(apiKey, prompt string) (string, error) {
 		return "", err
 	}
 
-	// Updated to gemini-3.8-flash as required by the API
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=%s", apiKey)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
@@ -226,51 +239,94 @@ func generateCompletionWithRetry(apiKey, prompt string, maxRetries int) (string,
 			return ans, nil
 		}
 
-		// If it's a 503 (high demand), sleep briefly and try again
-		log.Printf("[Attempt %d/%d] Model busy (503). Retrying in %v...", attempt+1, maxRetries, backoff)
+		log.Printf("[Attempt %d/%d] Upstream error: %v. Retrying in %v...", attempt+1, maxRetries, err, backoff)
 		time.Sleep(backoff)
-		backoff *= 2 // Exponential backoff: 500ms -> 1s -> 2s
+		backoff *= 2
 	}
 
-	return "", fmt.Errorf("exceeded max retries due to high demand")
+	return "", fmt.Errorf("exceeded max retries calling upstream model")
 }
 
 // ==========================================
-// 4. Gateway Dispatcher
+// 5. Core Gateway Pipeline
 // ==========================================
 
-func HandlePrompt(cache *SemanticCache, apiKey, prompt string, threshold float32) (string, string, time.Duration) {
+func HandlePrompt(cache *SemanticCache, apiKey, prompt string, threshold float32) (string, string, time.Duration, error) {
 	startTime := time.Now()
 
 	// 1. Exact Hit (L1)
 	if resp, hitType, ok := cache.Get(prompt, nil, threshold); ok {
-		return resp, hitType, time.Since(startTime)
+		return resp, hitType, time.Since(startTime), nil
 	}
 
 	// 2. Semantic Hit (L2)
 	vec, err := getEmbedding(apiKey, prompt)
 	if err == nil {
 		if resp, hitType, ok := cache.Get(prompt, vec, threshold); ok {
-			return resp, hitType, time.Since(startTime)
+			return resp, hitType, time.Since(startTime), nil
 		}
+	} else {
+		log.Printf("Warning: failed to compute embedding: %v", err)
 	}
 
-	// 3. Cache Miss: Ask Gemini
+	// 3. Cache Miss: Upstream Call
 	answer, err := generateCompletionWithRetry(apiKey, prompt, 3)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), "ERROR", time.Since(startTime)
+		return "", "ERROR", time.Since(startTime), err
 	}
 
-	// 4. Save to cache for next time
+	// 4. Save to Cache
 	if vec != nil {
 		cache.Set(prompt, vec, answer)
 	}
 
-	return answer, "CACHE_MISS (Fetched from Gemini)", time.Since(startTime)
+	return answer, "CACHE_MISS (Fetched Upstream)", time.Since(startTime), nil
 }
 
 // ==========================================
-// 5. Main Execution
+// 6. HTTP Server Handler
+// ==========================================
+
+func handleChatCompletions(cache *SemanticCache, apiKey string, threshold float32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "only POST method is accepted"})
+			return
+		}
+
+		var req ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "missing or invalid 'prompt' field in request body"})
+			return
+		}
+
+		log.Printf("[Incoming Request] Prompt: %q", req.Prompt)
+
+		answer, hitType, duration, err := HandlePrompt(cache, apiKey, req.Prompt, threshold)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		resp := ChatCompletionResponse{
+			Response:  answer,
+			HitType:   hitType,
+			LatencyMs: duration.Milliseconds(),
+		}
+
+		log.Printf("[Completed] Source: %s | Latency: %dms", hitType, duration.Milliseconds())
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// ==========================================
+// 7. Entry Point
 // ==========================================
 
 func main() {
@@ -281,22 +337,18 @@ func main() {
 
 	cache := NewSemanticCache()
 	threshold := float32(0.88)
+	port := ":8080"
 
-	// Test 1: Cold Start (Cache miss -> calls Gemini)
-	q1 := "What is the capital of France?"
-	fmt.Printf("[Test 1: Cold Start] Prompt: %q\n", q1)
-	ans1, status1, dur1 := HandlePrompt(cache, apiKey, q1, threshold)
-	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n\n", status1, dur1, ans1)
+	http.HandleFunc("/v1/chat/completions", handleChatCompletions(cache, apiKey, threshold))
 
-	// Test 2: Exact Match (L1 hit in microseconds -> 0 API calls)
-	q2 := "What is the capital of France?"
-	fmt.Printf("[Test 2: Exact Match] Prompt: %q\n", q2)
-	ans2, status2, dur2 := HandlePrompt(cache, apiKey, q2, threshold)
-	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n\n", status2, dur2, ans2)
+	// Health check endpoint
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
 
-	// Test 3: Paraphrase (L2 Semantic hit -> gets cached answer without asking LLM)
-	q3 := "Can you tell me the capital city of France?"
-	fmt.Printf("[Test 3: Paraphrase] Prompt: %q\n", q3)
-	ans3, status3, dur3 := HandlePrompt(cache, apiKey, q3, threshold)
-	fmt.Printf("Status: %s\nLatency: %v\nAnswer: %s\n", status3, dur3, ans3)
+	log.Printf("🚀 SynapseGateway listening on http://localhost%s", port)
+	if err := http.ListenAndServe(port, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
 }
