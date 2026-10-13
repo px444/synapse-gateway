@@ -67,8 +67,16 @@ func (g *GeminiClient) GetEmbedding(text string) ([]float32, error) {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=%s", g.apiKey)
-	resp, err := g.httpClient.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", g.apiKey)
+
+	resp, err := g.httpClient.Do(req)
+
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +113,15 @@ func (g *GeminiClient) GenerateCompletion(prompt string) (string, error) {
 		return "", err
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=%s", g.apiKey)
-	resp, err := g.httpClient.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", g.apiKey)
+
+	resp, err := g.httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}

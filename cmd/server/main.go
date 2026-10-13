@@ -24,7 +24,7 @@ func main() {
 	groqClient := client.NewGroqClient(groqKey)
 
 	// Notice all 4 arguments passed here:
-	gatewayHandler := proxy.NewGatewayHandler(semanticCache, geminiClient, groqClient, 0.88)
+	gatewayHandler := proxy.NewGatewayHandler(semanticCache, geminiClient, groqClient, 0.82)
 
 	// Routes
 	http.Handle("/v1/chat/completions", gatewayHandler)
